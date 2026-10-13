@@ -1,0 +1,80 @@
+diff --git a/src/openslide-vendor-hamamatsu.c b/src/openslide-vendor-hamamatsu.c
+index 1b3ac1d..22ad913 100644
+--- a/src/openslide-vendor-hamamatsu.c
++++ b/src/openslide-vendor-hamamatsu.c
+@@ -175,6 +175,8 @@ static bool jpeg_random_access_src(j_decompress_ptr cinfo,
+                                    int64_t header_length,
+                                    int64_t start_position,
+                                    int64_t stop_position,
++                                   int32_t tile_width,
++                                   int32_t tile_height,
+                                    GError **err) {
+   // check for problems
+   if ((0 >= header_sof_offset) ||
+@@ -228,9 +230,23 @@ static bool jpeg_random_access_src(j_decompress_ptr cinfo,
+     buffer[buffer_size - 1] = JPEG_EOI;
+   }
+ 
++  int64_t size_offset = header_sof_offset + 5;
++  if (tile_width > 0 && tile_height > 0) {
++    // Decoding one restart interval.  Describe it to libjpeg as the complete
++    // image it is: libjpeg derives its iMCU row count, component sizes and
++    // upsampling context from the SOF dimensions when it reads the header, so
++    // they must be right then.  Overwriting cinfo->image_width/height
++    // afterwards leaves those derived values stale, and a stream with
++    // vertically subsampled chroma (4:2:0, 4:4:0) makes libjpeg read ahead
++    // into a next iMCU row the data doesn't contain.
++    buffer[size_offset + 0] = (tile_height >> 8) & 0xff;
++    buffer[size_offset + 1] = tile_height & 0xff;
++    buffer[size_offset + 2] = (tile_width >> 8) & 0xff;
++    buffer[size_offset + 3] = tile_width & 0xff;
++  }
++
+   // check for overlarge or 0 X/Y in SOF (some NDPI JPEGs have this)
+   // change them to a value libjpeg will accept
+-  int64_t size_offset = header_sof_offset + 5;
+   uint16_t y = (buffer[size_offset + 0] << 8) +
+                 buffer[size_offset + 1];
+   if (y > JPEG_MAX_DIMENSION || y == 0) {
+@@ -613,12 +629,16 @@ static bool read_from_jpeg(openslide_t *osr,
+     // start decompressing
+     _openslide_jpeg_decompress_init(dc, &env);
+ 
++    bool tile_size_fits_sof = jpeg->tile_width <= JPEG_MAX_DIMENSION &&
++                              jpeg->tile_height <= JPEG_MAX_DIMENSION;
+     if (!jpeg_random_access_src(cinfo, f,
+                                 jpeg->header_data,
+                                 jpeg->header_sof_offset,
+                                 jpeg->header_length,
+                                 start_position,
+                                 stop_position,
++                                tile_size_fits_sof ? jpeg->tile_width : 0,
++                                tile_size_fits_sof ? jpeg->tile_height : 0,
+                                 err)) {
+       return false;
+     }
+@@ -630,8 +650,13 @@ static bool read_from_jpeg(openslide_t *osr,
+     }
+     cinfo->scale_num = 1;
+     cinfo->scale_denom = scale_denom;
+-    cinfo->image_width = jpeg->tile_width;  // cunning
+-    cinfo->image_height = jpeg->tile_height;
++    if (!tile_size_fits_sof) {
++      // Tile too large to describe in a SOF; override the dimensions after
++      // the header is read.  This leaves libjpeg's derived row count stale,
++      // which is only harmless without vertical chroma subsampling.
++      cinfo->image_width = jpeg->tile_width;  // cunning
++      cinfo->image_height = jpeg->tile_height;
++    }
+ 
+     //    g_debug("output_width: %d", cinfo->output_width);
+     //    g_debug("output_height: %d", cinfo->output_height);
+@@ -1008,7 +1033,7 @@ static bool validate_jpeg_header(struct _openslide_file *f,
+     _openslide_jpeg_decompress_init(dc, &env);
+     if (!jpeg_random_access_src(cinfo, f,
+                                 *header_data, *header_sof_offset,
+-                                *header_length, -1, -1, err)) {
++                                *header_length, -1, -1, 0, 0, err)) {
+       return false;
+     }
+ 

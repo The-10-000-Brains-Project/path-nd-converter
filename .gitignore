@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+.pytest_cache/
+dist/
+build/
+.claude/
+
+# slides and conversion output are data, never source
+*.svs
+*.ndpi
+*.tif
+*.tiff

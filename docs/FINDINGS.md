@@ -99,9 +99,55 @@ tile at a time and the converted stream is decoded continuously.
 
 ## JPEG 2000
 
-JPEG 2000 SVS pages (TIFF compression 33003/33005) cannot be carried: NDPI readers decode JPEG only. Re-encoding
-one page of `JP2K-33003-1.svs` as 4:4:4 JPEG: quality 100 → 90.6% of pixels change (max error 4, PSNR 51 dB),
-data grows from 2.36 MB to 15.6 MB.
+JPEG 2000 SVS pages (TIFF compression 33003, 33005 or 34712) can't be carried: NDPI readers decode JPEG only.
+The pixels have to be decoded and re-encoded. Measured on one page of each real sample (the decoded JPEG 2000
+is the reference; "exact" means all three channels are equal):
+
+| re-encoding | exact pixels | largest error | size vs the JPEG 2000 |
+|---|---|---|---|
+| YCbCr 4:4:4, quality 100 | 9% / 43% | 4 / 5 | 6.6× / 4.9× |
+| RGB stored directly, quality 100 | 83% / 87% | 2 / 2 | 10.5× / 8.4× |
+| same, optimised Huffman tables | 83% / 87% | 2 / 2 | 9.8× / 8.0× |
+| RGB, quality 98 | 52% / 68% | 4 / 5 | 8.2× / 6.3× |
+| RGB, quality 95 | 42% / 62% | 11 / 11 | 6.1× / 4.6× |
+| RGB, quality 90 | 33% / 57% | 25 / 23 | 4.4× / 3.3× |
+| lossless JPEG (SOF3) | 100% | 0 | 10.9× / 9.7× |
+
+First number: `JP2K-33003-1.svs` page 2 (YCbCr JPEG 2000). Second: `CMU-1-JP2K-33005.svs` page 3 (RGB JPEG 2000).
+
+Storing RGB directly, the way Aperio's own JPEG slides do, avoids the rounding error of the RGB to YCbCr
+conversion, which is why it is so much closer. The remaining error is the DCT's own rounding with all-ones
+quantisation tables. The converter's `--lossy-jpeg2000` uses the RGB, quality 100, 4:4:4 row with the standard
+Huffman tables (every tile then shares the same tables, which the converter requires).
+
+On the whole `JP2K-33003-1.svs` (63.8 MB): 694 MB output, converted in 103 s. Exact-pixel share by level: 75.8%
+(top), 83.0%, 82.2%. The NDPI is byte-exact against the re-encoded tiles, and OpenSlide reads 75.9% of sampled
+top-level pixels exactly equal to the original JPEG 2000 decode. Making individual pixels exact by searching for DCT
+coefficients whose rounded decode hits the target was not tried. It would only be exact for one particular IDCT
+implementation, since other decoders differ by 1.
+
+### Lossless JPEG in an NDPI
+
+libjpeg-turbo 3.x can write and read lossless JPEG (SOF3), and `djpeg` decodes one of the JPEG 2000 pages
+bit-exactly. Inside an NDPI structure, OpenSlide's behaviour depends on restart markers:
+
+- With restart markers (needed to read a region without decoding the whole level), it is rejected when the file is
+  opened: "Restart interval greater than MCUs per row". OpenSlide assumes a restart interval is a run of 8-pixel
+  blocks in one block row. In lossless JPEG an interval counts single pixels.
+- Without restart markers it opens, and a region read matches the JPEG 2000 decode exactly (tested on a 1600x1200
+  crop), because OpenSlide then treats the whole level as one tile. Every uncached read decodes the whole level,
+  which needs width x height x 4 bytes: 0.07 GB at 3848x4376, 1.1 GB at 15376x17504, 6 GB at 46000x32914, 32 GB at
+  100000x80000. Usable for small levels only. Hamamatsu's software is unlikely to read it, and OpenSlide builds with
+  an older libjpeg-turbo can't decode SOF3 at all.
+
+## Decoder speed
+
+The first version read the entropy-coded data through one big Python integer. Every shift of that integer costs time
+proportional to its length, so decoding a tile cost time proportional to the square of its size. Ordinary Aperio
+tiles (10-15 KB) hid it. Quality-100 tiles (~90 KB) made a 31 MB conversion take 8 minutes. Reading bits through a
+5-byte window starting at the current byte makes each read constant-time. Output was checked unchanged (JPEG stream
+hashes identical before and after on two real slides, and byte-exact verification on all of them), and the
+1.5-gigapixel `CMU-1.svs` went from about 9 minutes to 41 seconds.
 
 ## Bugs found on the way (each fixed)
 

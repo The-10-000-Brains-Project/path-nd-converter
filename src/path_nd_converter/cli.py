@@ -27,7 +27,8 @@ def _inspect(a: argparse.Namespace) -> int:
 
 def _convert(a: argparse.Namespace) -> int:
     try:
-        convert(a.src, a.dst, a.levels, macro=a.macro, repeat=a.repeat, workers=a.workers)
+        convert(a.src, a.dst, a.levels, macro=a.macro, repeat=a.repeat, workers=a.workers,
+                lossy_jpeg2000=a.lossy_jpeg2000, jpeg2000_quality=a.jpeg2000_quality, workdir=a.workdir)
     except Unsupported as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -57,6 +58,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--levels", type=int, nargs="+", required=True, help="TIFF page indexes of the pyramid levels, largest first")
     p.add_argument("--macro", type=int, default=None, help="TIFF page index of the macro image")
     p.add_argument("--workers", type=int, default=None)
+    p.add_argument("--lossy-jpeg2000", action="store_true",
+                   help="re-encode JPEG 2000 pages as near-lossless JPEG. NOT exact: most pixels match, a few differ by 1-2")
+    p.add_argument("--jpeg2000-quality", type=int, default=100, help="JPEG quality for --lossy-jpeg2000 (default 100)")
+    p.add_argument("--workdir", default=None, help="keep re-encoded intermediate files here (lets you run verify against them)")
     p.add_argument("--repeat", type=int, default=1, help=argparse.SUPPRESS)  # test only: stack level 0 to exceed 4 GiB
     p.set_defaults(fn=_convert)
     p = sub.add_parser("verify", help="check a converted page against the source, tile by tile")

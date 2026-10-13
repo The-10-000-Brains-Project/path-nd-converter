@@ -12,7 +12,9 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import re
+import shutil
 import struct
+import tempfile
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -120,6 +122,14 @@ def page_spec(src: str, pi: int) -> dict[str, Any]:
     return spec
 
 
+def describe_page(src: str, pi: int) -> dict[str, Any]:
+    """Size, compression and description of any page, whether or not it can be converted."""
+    with tifffile.TiffFile(src) as t:
+        p = t.pages[pi]
+        return dict(W0=p.imagewidth, H0=p.imagelength, compression=int(p.compression), name=p.compression.name,
+                    desc=p.tags[270].value if 270 in p.tags else "")
+
+
 def sampling_label(comps: list) -> str:
     return {(1, 1): "4:4:4", (2, 1): "4:2:2", (1, 2): "4:4:0", (2, 2): "4:2:0", (4, 1): "4:1:1"}.get((comps[0][1], comps[0][2]), f"{comps[0][1]}x{comps[0][2]}")
 
@@ -137,6 +147,8 @@ def inspect_file(src: str) -> list[dict[str, Any]]:
             row.update(convertible=True, sampling=sampling_label(s["comps"]), tables="shared (JPEGTables)" if s["jt"] else "embedded per tile", note="")
         except Unsupported as exc:
             row["note"] = str(exc)
+            if comp.startswith("APERIO_JP2000") or comp == "JPEG2000":
+                row["note"] += "; with --lossy-jpeg2000 it can be re-encoded as near-lossless JPEG (not exact)"
         rows.append(row)
     return rows
 
@@ -158,37 +170,40 @@ def iter_mcu_rows(tile: bytes, spec: dict[str, Any]):
     sel = {cid: (td, ta) for cid, td, ta in hdr["sos"]}
     tabsel = [sel[c[0]] for c in sof["comps"]]
     end = len(tile) - 2 if tile[-2:] == b"\xff\xd9" else len(tile)
-    data = unstuff(tile[hdr["scan"] : end])
-    big = int.from_bytes(data + b"\x00\x00\x00", "big")
-    total = (len(data) + 3) * 8
+    data = unstuff(tile[hdr["scan"] : end]) + bytes(8)  # zero padding so the 5-byte window below never runs short
     mcus_w, mcus_h = -(-sof["w"] // spec["mcu_w"]), -(-sof["h"] // spec["mcu_h"])
     bmap, pos, pred = spec["bmap"], 0, [0] * len(spec["comps"])
+    frm = int.from_bytes
+    # Bit reads use a 40-bit window starting at the current byte: a code (<=16 bits) plus its extra bits (<=11)
+    # plus the in-byte offset (<=7) always fit, and each read costs the same however long the tile is.
     for _ in range(mcus_h):
         row = []
         for _ in range(mcus_w):
             mcu = []
             for ci in bmap:
                 td, ta = tabsel[ci]
-                sym, ln = dc_lut[td][(big >> (total - pos - 16)) & 0xFFFF]
-                pos += ln
+                o = pos & 7
+                v = frm(data[pos >> 3 : (pos >> 3) + 5], "big")
+                sym, ln = dc_lut[td][(v >> (24 - o)) & 0xFFFF]
                 if sym:
-                    bits = (big >> (total - pos - sym)) & ((1 << sym) - 1)
-                    pos += sym
+                    bits = (v >> (40 - o - ln - sym)) & ((1 << sym) - 1)
                     pred[ci] += bits if bits >> (sym - 1) else bits - (1 << sym) + 1
+                pos += ln + sym
                 toks, k, lut = [], 1, ac_lut[ta]
                 while k < 64:
-                    rs, ln = lut[(big >> (total - pos - 16)) & 0xFFFF]
-                    pos += ln
+                    o = pos & 7
+                    v = frm(data[pos >> 3 : (pos >> 3) + 5], "big")
+                    rs, ln = lut[(v >> (24 - o)) & 0xFFFF]
                     r, s = rs >> 4, rs & 15
                     if s == 0:
+                        pos += ln
                         toks.append((rs, 0, 0))
                         if r == 15:
                             k += 16
                             continue
                         break
-                    bits = (big >> (total - pos - s)) & ((1 << s) - 1)
-                    pos += s
-                    toks.append((rs, bits, s))
+                    toks.append((rs, (v >> (40 - o - ln - s)) & ((1 << s) - 1), s))
+                    pos += ln + s
                     k += r + 1
                 mcu.append((pred[ci], toks))
             row.append(tuple(mcu))
@@ -392,36 +407,69 @@ def write_ifds(out: _Out, pages: list[dict], mpp0: float, mag0: float, props: di
     f.close()
 
 
-def convert(src: str, dst: str, levels: list[int], macro: int | None = None, repeat: int = 1, workers: int | None = None, log=print) -> None:
-    """Convert the given JPEG pages of an SVS (largest level first) to a multi-level NDPI-style file.
+def convert(src: str, dst: str, levels: list[int], macro: int | None = None, repeat: int = 1, workers: int | None = None,
+            lossy_jpeg2000: bool = False, jpeg2000_quality: int = 100, workdir: str | None = None, log=print) -> None:
+    """Convert the given pages of an SVS (largest level first) to a multi-level NDPI-style file.
 
+    JPEG 2000 pages are refused unless `lossy_jpeg2000` is set; then they are re-encoded as near-lossless JPEG
+    (RGB, 4:4:4, quality `jpeg2000_quality`), which is NOT exact, and the measured pixel error is recorded in the
+    output's provenance. `workdir` keeps the re-encoded intermediate files (otherwise they are deleted).
     `repeat` stacks the first level K times and exists only to build >4 GiB test files."""
+    from .jpeg2000 import J2K_CODES, reencode_page
+
     if not levels:
         raise ValueError("at least one level page is required")
-    s0 = page_spec(src, levels[0])
-    mpp = re.search(r"MPP\s*=\s*([0-9.]+)", s0["desc"])
-    mag = re.search(r"AppMag\s*=\s*([0-9.]+)", s0["desc"])
+    info = {pi: describe_page(src, pi) for pi in list(levels) + ([macro] if macro is not None else [])}
+    for pi, d in info.items():
+        if d["compression"] in J2K_CODES and not lossy_jpeg2000:
+            raise Unsupported(f"page {pi}: TIFF compression {d['compression']} ({d['name']}); NDPI can only hold JPEG. "
+                              "Pass --lossy-jpeg2000 to re-encode it as near-lossless JPEG (the pixels will not be exactly equal)")
+    d0 = info[levels[0]]
+    mpp = re.search(r"MPP\s*=\s*([0-9.]+)", d0["desc"])
+    mag = re.search(r"AppMag\s*=\s*([0-9.]+)", d0["desc"])
     mpp0, mag0 = float(mpp.group(1)) if mpp else 0.5, float(mag.group(1)) if mag else 20.0
     props = {
         "Provenance.Notice": "Experimental conversion; this file was NOT produced by a Hamamatsu scanner",
-        "Provenance.SourceFormat": "Aperio SVS (TIFF/JPEG)",
-        "Provenance.SourceWidth": s0["W0"],
-        "Provenance.SourceHeight": s0["H0"],
-        "Provenance.Converter": f"path-nd-converter {__version__} (lossless entropy-layer transcode)",
+        "Provenance.SourceFormat": "Aperio SVS (TIFF/JPEG 2000)" if d0["compression"] in J2K_CODES else "Aperio SVS (TIFF/JPEG)",
+        "Provenance.SourceWidth": d0["W0"],
+        "Provenance.SourceHeight": d0["H0"],
+        "Provenance.Converter": f"path-nd-converter {__version__} " + ("(JPEG 2000 re-encoded as JPEG; pixels NOT identical)" if lossy_jpeg2000 and any(d["compression"] in J2K_CODES for d in info.values()) else "(lossless entropy-layer transcode)"),
         "Provenance.ConvertedAtUTC": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "Provenance.SourceDescription": s0["desc"].replace("\r", " ").replace("\n", " | ")[:900],
+        "Provenance.SourceDescription": d0["desc"].replace("\r", " ").replace("\n", " | ")[:900],
     }
+    tmp = workdir or tempfile.mkdtemp(prefix="path-nd-converter-")
+    os.makedirs(tmp, exist_ok=True)
     out = _Out(dst)
     pages = []
     try:
+        sources: dict[int, tuple[str, int]] = {}
+        errs = []
+        for pi, d in info.items():
+            if d["compression"] in J2K_CODES:
+                inter = os.path.join(tmp, f"page{pi}.jpeg-reencoded.tif")
+                log(f"page {pi}: re-encoding JPEG 2000 as RGB JPEG, quality {jpeg2000_quality} (not exact)")
+                st = reencode_page(src, pi, inter, quality=jpeg2000_quality, workers=workers)
+                log(f"  pixels exactly equal to the JPEG 2000 decode: {100 * st['exact_pixels'] / st['pixels']:.2f}%, largest error {st['max_error']}, "
+                    f"mean absolute error {st['mean_abs_error']:.3f}")
+                errs.append((pi, st))
+                sources[pi] = (inter, 0)
+            else:
+                sources[pi] = (src, pi)
+        if errs:
+            props["Provenance.Jpeg2000.Method"] = f"decoded and re-encoded as baseline JPEG, RGB components, 4:4:4, quality {jpeg2000_quality}"
+            for pi, st in errs:
+                props[f"Provenance.Jpeg2000.Page{pi}.ExactPixelsPercent"] = f"{100 * st['exact_pixels'] / st['pixels']:.2f}"
+                props[f"Provenance.Jpeg2000.Page{pi}.MaxPixelError"] = st["max_error"]
         with mp.Pool(workers or max(1, mp.cpu_count() - 1)) as pool:
             for k, pi in enumerate(levels):
-                pg = convert_page(src, pi, pool, out, repeat=repeat if k == 0 else 1)
+                ssrc, spi = sources[pi]
+                pg = convert_page(ssrc, spi, pool, out, repeat=repeat if k == 0 else 1)
                 log(f"page {pi}: {pg['spec']['W0']}x{pg['spec']['H0']} -> {pg['W']}x{pg['H']}, {sampling_label(pg['spec']['comps'])}, "
                     f"{pg['spec']['mcu_w']}x{pg['spec']['mcu_h']} MCU, restart interval {pg['interval']}, {pg['strip_len'] / 1e6:.1f} MB")
                 pages.append(pg)
             if macro is not None:
-                pg = convert_page(src, macro, pool, out)
+                ssrc, spi = sources[macro]
+                pg = convert_page(ssrc, spi, pool, out)
                 pg["macro"] = True
                 log(f"macro page {macro}: {pg['W']}x{pg['H']}")
                 pages.append(pg)
@@ -431,3 +479,6 @@ def convert(src: str, dst: str, levels: list[int], macro: int | None = None, rep
         if os.path.exists(dst):
             os.remove(dst)  # never leave a truncated file that looks like a result
         raise
+    finally:
+        if not workdir:
+            shutil.rmtree(tmp, ignore_errors=True)

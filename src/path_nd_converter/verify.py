@@ -41,33 +41,35 @@ def read_ndpi_page(path: str, k: int) -> dict[str, Any]:
 
 def decode_scan(data: bytes, n_mcu: int, spec: dict[str, Any], tabsel: list) -> list:
     _, _, dc_lut, ac_lut = make_luts(spec["dht"])
-    big = int.from_bytes(data + b"\x00\x00\x00", "big")
-    total = (len(data) + 3) * 8
+    data = data + bytes(8)  # padding for the 5-byte read window (see convert.iter_mcu_rows)
+    frm = int.from_bytes
     pos, pred, out = 0, [0] * len(spec["comps"]), []
     for _ in range(n_mcu):
         mcu = []
         for ci in spec["bmap"]:
             td, ta = tabsel[ci]
-            sym, ln = dc_lut[td][(big >> (total - pos - 16)) & 0xFFFF]
-            pos += ln
+            o = pos & 7
+            v = frm(data[pos >> 3 : (pos >> 3) + 5], "big")
+            sym, ln = dc_lut[td][(v >> (24 - o)) & 0xFFFF]
             if sym:
-                bits = (big >> (total - pos - sym)) & ((1 << sym) - 1)
-                pos += sym
+                bits = (v >> (40 - o - ln - sym)) & ((1 << sym) - 1)
                 pred[ci] += bits if bits >> (sym - 1) else bits - (1 << sym) + 1
+            pos += ln + sym
             toks, k, lut = [], 1, ac_lut[ta]
             while k < 64:
-                rs, ln = lut[(big >> (total - pos - 16)) & 0xFFFF]
-                pos += ln
+                o = pos & 7
+                v = frm(data[pos >> 3 : (pos >> 3) + 5], "big")
+                rs, ln = lut[(v >> (24 - o)) & 0xFFFF]
                 r, s = rs >> 4, rs & 15
                 if s == 0:
+                    pos += ln
                     toks.append((rs, 0, 0))
                     if r == 15:
                         k += 16
                         continue
                     break
-                bits = (big >> (total - pos - s)) & ((1 << s) - 1)
-                pos += s
-                toks.append((rs, bits, s))
+                toks.append((rs, (v >> (40 - o - ln - s)) & ((1 << s) - 1), s))
+                pos += ln + s
                 k += r + 1
             mcu.append((pred[ci], toks))
         out.append(tuple(mcu))

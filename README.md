@@ -11,7 +11,8 @@ software. Keep your original SVS files.
 An SVS stores a slide as many small, independent JPEG tiles. An NDPI stores each pyramid level as one big JPEG
 with restart markers. This tool moves the compressed data from the first layout into the second. The Huffman
 codes for each block are copied unchanged. Only the DC values are re-encoded, because a restart marker resets
-them. No pixel is decoded and nothing is re-quantised.
+them. No pixel is decoded and nothing is re-quantised. JPEG 2000 slides are the exception: they
+are refused unless you opt in to a re-encode that is close but not exact (see below).
 
 ## Usage
 
@@ -57,7 +58,29 @@ $ path-nd-converter convert JP2K-33003-1.svs out.ndpi --levels 0
 error: TIFF compression 33003 (APERIO_JP2000_YCBC); NDPI can only hold JPEG
 ```
 
-The sizes in the example went from 2220x2967 to 2224x2968. NDPI readers need the image to be a whole number of
+### JPEG 2000 slides (opt-in, not exact)
+
+NDPI can only hold JPEG, so JPEG 2000 pixels can't be carried exactly. With `--lossy-jpeg2000` the tool decodes
+each tile and re-encodes it as a JPEG that stores RGB directly, at quality 100, which gets very close but not
+equal. It measures how close while it works and writes the result into the output file.
+
+```console
+$ path-nd-converter convert JP2K-33003-1.svs out.ndpi --levels 0 2 3 --macro 5 --lossy-jpeg2000
+page 0: re-encoding JPEG 2000 as RGB JPEG, quality 100 (not exact)
+  pixels exactly equal to the JPEG 2000 decode: 75.82%, largest error 2, mean absolute error 0.088
+page 2: re-encoding JPEG 2000 as RGB JPEG, quality 100 (not exact)
+  pixels exactly equal to the JPEG 2000 decode: 83.00%, largest error 2, mean absolute error 0.068
+page 3: re-encoding JPEG 2000 as RGB JPEG, quality 100 (not exact)
+  pixels exactly equal to the JPEG 2000 decode: 82.22%, largest error 2, mean absolute error 0.070
+page 0: 15374x17497 -> 15376x17504, 4:4:4, 8x8 MCU, restart interval 62, 661.7 MB
+...
+```
+
+That slide went from 64 MB to 694 MB. Add `--workdir DIR` to keep the re-encoded intermediate JPEG files; `verify`
+can then check the NDPI against them, which shows the second step (JPEG to NDPI) is still byte-exact even though
+the first step (JPEG 2000 to JPEG) is not.
+
+The sizes in the first example went from 2220x2967 to 2224x2968. NDPI readers need the image to be a whole number of
 JPEG blocks across and down, so the converter pads the edges. The original size is saved in the file (see
 Known problems, item 4).
 
@@ -77,6 +100,12 @@ no pixel differences.
 The largest levels were checked with the scratch scripts this package was built from, which use the same
 logic. The packaged `verify` has been run on the smaller levels, the macro images, the small slide above, and
 the slides `pytest` builds. `pytest` runs these checks on small slides it builds itself.
+
+For JPEG 2000, one real slide (`JP2K-33003-1.svs`, 15374x17497) was converted with `--lossy-jpeg2000`. The NDPI is
+byte-exact against the re-encoded tiles on every level (4.2 million blocks on the top level), and the pixels read
+through OpenSlide are 75.9% exactly equal to the original JPEG 2000 decode, with a largest error of 2. A second
+sample (`CMU-1-JP2K-33005.svs`, RGB JPEG 2000) was tested for the re-encoding step only: 86.7% exact, largest
+error 2.
 
 ## Known problems
 
@@ -98,16 +127,22 @@ the slides `pytest` builds. `pytest` runs these checks on small slides it builds
 5. Subsampled chroma decodes a little differently. The coefficients are identical, but a reader that decodes the
    single stream interpolates colour across tile edges, where a per-tile decode can't. About 0.2% to 0.4% of
    pixels differ, all on source-tile edge rows and columns. A non-interpolating upsampler gives identical pixels.
-6. JPEG 2000 slides can't be converted exactly. NDPI holds only JPEG, so the pixels would have to be re-encoded.
-   On one test page that changed 90.6% of pixels even at quality 100 (largest error 4) and made the data 6.6
-   times larger. These pages are refused.
+6. JPEG 2000 slides can't be converted exactly. NDPI holds only JPEG, so by default these pages are refused.
+   With `--lossy-jpeg2000` they are re-encoded as RGB JPEG at quality 100. On the two samples tried, 76% to 87% of
+   pixels end up exactly equal and the largest difference is 2 (out of 255), but the other pixels do differ and the
+   data grows 8 to 11 times. Re-encoding through YCbCr instead is much worse (9% to 43% exact, largest error 4 to 5).
+   Quality 95 shrinks the data to 4.6 to 6 times but allows errors up to 11. A lossless JPEG is bit-exact and
+   OpenSlide can read one, but only when it has no restart markers, which makes each level a single tile that must
+   be decoded whole. That works for small levels and not for real slides (see `docs/FINDINGS.md`).
 7. The label and thumbnail images aren't carried over, because NDPI has no place for them. ICC profiles and
    Aperio's own metadata aren't either, apart from the description text kept in `Provenance.SourceDescription`.
 8. Some values are placeholders. Slide-centre offsets and the focal plane are 0. Make, Model and Software name
    this tool, and the date is when the file was written. The file says in its properties that it was not
    produced by a Hamamatsu scanner.
-9. It hasn't been run at scale. It is pure Python (about 10 minutes for a 1.5-gigapixel slide on 10 cores) and
-   holds one level's compressed data in memory. The largest real file converted was about 250 MB.
+9. Scale is only partly tested. It is pure Python. The 1.5-gigapixel `CMU-1.svs` (156 MB of JPEG at the top level)
+   converts in 41 seconds on a 10-core Mac, with the main process peaking near 200 MB, and the 270-megapixel JPEG 2000
+   slide in 103 seconds. The converter holds one level's compressed data in memory, so a level of several gigabytes
+   would need that much RAM. The largest real source converted was about 250 MB.
 10. It stops with an error on progressive or 12-bit JPEG, non-JPEG pages, missing or zero-length tiles,
     quantisation tables that differ between tiles of one page, and tile sizes that aren't a whole number of
     JPEG blocks.

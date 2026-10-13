@@ -16,6 +16,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+jpeg2000 = [
+    "imagecodecs>=2024.1",
+]
 dev = [
     "pytest>=8.0",
     "imagecodecs>=2024.1",

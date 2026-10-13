@@ -126,6 +126,23 @@ top-level pixels exactly equal to the original JPEG 2000 decode. Making individu
 coefficients whose rounded decode hits the target was not tried. It would only be exact for one particular IDCT
 implementation, since other decoders differ by 1.
 
+### Why the JPEG route cannot be made exact
+
+Searching for coefficients whose decode equals the JPEG 2000 pixels was tried. libjpeg's integer inverse DCT was
+ported to numpy and checked bit-for-bit against libjpeg-turbo (3,072 blocks, 0 differences). A local +-1 search over
+coefficients raised the share of exactly reproduced 8x8 blocks from 9% / 32% (plain rounding) to 29% / 50% (two
+pages) and no further. Exact integer programming on smaller blocks of real tissue showed that many blocks have no
+integer coefficients that decode to the target at all: 9% of 2-sample, 24% of 4-sample, 34% of 8-sample and 44% of
+16-sample 1-D blocks, and 33% / 37% of 3x3 / 4x4 2-D blocks (2x2: 0%). This matches a geometric argument: the
+decode is a rotated integer lattice, and its rounding window contains a lattice point only about 63% of the time.
+The 8x8 case is extrapolated from these, not proven. So a standard JPEG decode cannot reproduce the pixels of a
+large share of blocks, whatever the encoder does.
+
+Ways to keep exact data alongside an approximate JPEG layer (measured on one 3843x4374 page, JPEG 2000 = 2.36 MB;
+not implemented): the original JPEG 2000 bytes stored next to a q100 JPEG = 27.2 MB (q80: 9.5 MB); a q100 JPEG plus
+an lzma-compressed residual = 28.0 MB. Stock readers would see only the JPEG layer; an aware tool would need a
+private TIFF tag.
+
 ### Lossless JPEG in an NDPI
 
 libjpeg-turbo 3.x can write and read lossless JPEG (SOF3), and `djpeg` decodes one of the JPEG 2000 pages
